@@ -1,0 +1,345 @@
+-- ============================
+-- CONFIG
+-- ============================
+local AUTO_DELAY = 1
+local COLLECT_DISTANCE = 5
+local TARGET_RARITY = "COMMON" -- เปลี่ยนตรงนี้ถ้าอยากเปลี่ยน rarity เป้าหมาย
+local TWEEN_SPEED = 60 -- studs ต่อวินาที (ปรับความเร็วตรงนี้)
+
+-- ============================
+-- STATE
+-- ============================
+local running = false
+local loopThread = nil
+local currentTween = nil
+
+local TweenService = game:GetService("TweenService")
+
+-- ============================
+-- CORE FUNCTIONS
+-- ============================
+
+local function findRealSeedChild(holder)
+    for _, child in ipairs(holder:GetChildren()) do
+        if child:IsA("Model") or child:IsA("BasePart") then
+            return child
+        end
+    end
+    return nil
+end
+
+local function getNewestCommonSeed()
+    local bigField = workspace:FindFirstChild("BigField")
+    if not bigField then
+        warn("[DEBUG] ไม่พบ workspace.BigField")
+        return nil, nil
+    end
+
+    local conveyorSeeds = bigField:FindFirstChild("ConveyorSeeds")
+    if not conveyorSeeds then
+        warn("[DEBUG] ไม่พบ BigField.ConveyorSeeds")
+        return nil, nil
+    end
+
+    local holders = conveyorSeeds:GetChildren()
+    print("[DEBUG] จำนวน SeedHolder ทั้งหมด:", #holders)
+
+    local bestChild = nil
+    local bestHolder = nil
+    local bestHolderName = nil
+    local bestSeedType = nil
+    local lowestSpawnId = math.huge
+
+    for _, holder in ipairs(holders) do
+        local attrs = holder:GetAttributes()
+        local rarity = attrs.Rarity
+        local seedType = attrs.SeedType
+        local spawnId = attrs.SpawnId
+
+        if rarity == TARGET_RARITY then
+            print(string.format(
+                "[DEBUG] holder=%s | Rarity=%s SeedType=%s SpawnId=%s",
+                holder.Name, tostring(rarity), tostring(seedType), tostring(spawnId)
+            ))
+
+            if spawnId and spawnId < lowestSpawnId then
+                local child = findRealSeedChild(holder)
+                if child then
+                    lowestSpawnId = spawnId
+                    bestChild = child
+                    bestHolder = holder
+                    bestHolderName = holder.Name
+                    bestSeedType = seedType
+                else
+                    warn("[DEBUG] holder=" .. holder.Name .. " ไม่พบ child จริง (Model/BasePart) ข้างใน")
+                end
+            end
+        end
+    end
+
+    if not bestChild then
+        warn("[DEBUG] ไม่เจอเมล็ด Rarity=" .. TARGET_RARITY .. " เลยในตอนนี้")
+    else
+        print(string.format(
+            "[DEBUG] เลือก holder=%s | SeedType=%s | SpawnId ต่ำสุด=%s | child จริง=%s",
+            bestHolderName, tostring(bestSeedType), tostring(lowestSpawnId), bestChild.Name
+        ))
+    end
+
+    return bestChild, bestHolder
+end
+
+local function getSeedPosition(seed)
+    if seed:IsA("Model") and seed.PrimaryPart then
+        return seed.PrimaryPart.Position
+    elseif seed:IsA("BasePart") then
+        return seed.Position
+    end
+    warn("[DEBUG] seed ไม่ใช่ Model ที่มี PrimaryPart หรือ BasePart:", seed.Name, seed.ClassName)
+    return nil
+end
+
+local function collectSeed(holder)
+    local prompt = holder:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if not prompt then
+        warn("[DEBUG] ไม่พบ ProximityPrompt ใน holder:", holder.Name)
+        return false
+    end
+    print("[DEBUG] กำลังเก็บจาก holder:", holder.Name)
+    fireproximityprompt(prompt)
+    return true
+end
+
+-- ============================
+-- TWEEN MOVEMENT
+-- ============================
+local function tweenTo(rootPart, targetPosition)
+    if currentTween then
+        currentTween:Cancel()
+        currentTween = nil
+    end
+
+    local distance = (rootPart.Position - targetPosition).Magnitude
+    local duration = math.max(distance / TWEEN_SPEED, 0.1)
+
+    local targetCFrame = CFrame.new(targetPosition)
+
+    local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut)
+    local tween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCFrame })
+    currentTween = tween
+
+    print(string.format("[DEBUG] เริ่ม Tween ระยะทาง=%.1f ใช้เวลา=%.2fวิ", distance, duration))
+    tween:Play()
+
+    local completed = false
+    local connection
+    connection = tween.Completed:Connect(function()
+        completed = true
+    end)
+
+    local elapsed = 0
+    while running and not completed and elapsed < duration + 1 do
+        task.wait(0.1)
+        elapsed = elapsed + 0.1
+    end
+
+    connection:Disconnect()
+
+    if not running and tween.PlaybackState == Enum.PlaybackState.Playing then
+        tween:Cancel()
+        print("[DEBUG] ยกเลิก Tween เพราะถูกสั่งหยุด")
+    end
+
+    currentTween = nil
+    return completed
+end
+
+-- ============================
+-- MAIN LOOP
+-- ============================
+local function autoLoop()
+    local player = game.Players.LocalPlayer
+    print("[DEBUG] เริ่ม autoLoop")
+
+    while running do
+        local character = player.Character
+        if not character then
+            print("[DEBUG] รอ character...")
+            character = player.CharacterAdded:Wait()
+        end
+        local humanoid = character:WaitForChild("Humanoid")
+        local rootPart = character:WaitForChild("HumanoidRootPart")
+
+        local seed, holder = getNewestCommonSeed()
+
+        if seed and holder then
+            local pos = getSeedPosition(seed)
+            if pos then
+                local targetPos = Vector3.new(pos.X, rootPart.Position.Y, pos.Z)
+
+                print("[DEBUG] Tween ไปที่:", targetPos, "| seed:", seed.Name)
+                tweenTo(rootPart, targetPos)
+
+                if running then
+                    collectSeed(holder)
+                end
+            end
+        else
+            print("[DEBUG] รอบนี้ไม่เจอ seed ที่ตรงเงื่อนไข")
+        end
+
+        task.wait(AUTO_DELAY)
+    end
+
+    print("[DEBUG] ออกจาก autoLoop (running=false)")
+end
+
+local function startAuto()
+    if running then return end
+    running = true
+    loopThread = task.spawn(autoLoop)
+end
+
+local function stopAuto()
+    running = false
+    if currentTween then
+        currentTween:Cancel()
+        currentTween = nil
+    end
+end
+
+-- ============================
+-- GUI
+-- ============================
+local player = game.Players.LocalPlayer
+
+local function getGuiParent()
+    local ok, hiddenui = pcall(function() return gethui() end)
+    if ok and hiddenui then return hiddenui end
+
+    local ok2, coreGui = pcall(function() return game:GetService("CoreGui") end)
+    if ok2 and coreGui then return coreGui end
+
+    return player:WaitForChild("PlayerGui")
+end
+
+local guiParent = getGuiParent()
+
+local oldGui = guiParent:FindFirstChild("AutoSeedGui")
+if oldGui then oldGui:Destroy() end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AutoSeedGui"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 999
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = guiParent
+
+pcall(function()
+    if syn and syn.protect_gui then
+        syn.protect_gui(screenGui)
+    elseif protectgui then
+        protectgui(screenGui)
+    end
+end)
+
+print("[DEBUG] สร้าง GUI แล้ว, parent อยู่ที่:", screenGui.Parent:GetFullName())
+
+local floatButton = Instance.new("TextButton")
+floatButton.Size = UDim2.new(0, 40, 0, 40)
+floatButton.Position = UDim2.new(0, 20, 0.5, -20)
+floatButton.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+floatButton.Text = "🌱"
+floatButton.TextSize = 20
+floatButton.Visible = false
+floatButton.Parent = screenGui
+
+local floatCorner = Instance.new("UICorner")
+floatCorner.CornerRadius = UDim.new(1, 0)
+floatCorner.Parent = floatButton
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 200, 0, 90)
+frame.Position = UDim2.new(0, 20, 0.5, -45)
+frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = frame
+
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.new(0, 22, 0, 22)
+closeButton.Position = UDim2.new(1, -26, 0, 4)
+closeButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.Font = Enum.Font.GothamBold
+closeButton.TextSize = 14
+closeButton.Parent = frame
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 6)
+closeCorner.Parent = closeButton
+
+closeButton.MouseButton1Click:Connect(function()
+    frame.Visible = false
+    floatButton.Visible = true
+end)
+
+floatButton.MouseButton1Click:Connect(function()
+    frame.Visible = true
+    floatButton.Visible = false
+end)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -30, 0, 25)
+title.BackgroundTransparency = 1
+title.Text = "Auto Collect Seed"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.Parent = frame
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, 0, 0, 20)
+statusLabel.Position = UDim2.new(0, 0, 0, 25)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "สถานะ: หยุดอยู่"
+statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 13
+statusLabel.Parent = frame
+
+local toggleButton = Instance.new("TextButton")
+toggleButton.Size = UDim2.new(1, -20, 0, 30)
+toggleButton.Position = UDim2.new(0, 10, 0, 50)
+toggleButton.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+toggleButton.Text = "เริ่มทำงาน"
+toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleButton.Font = Enum.Font.GothamBold
+toggleButton.TextSize = 14
+toggleButton.Parent = frame
+
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(0, 6)
+btnCorner.Parent = toggleButton
+
+toggleButton.MouseButton1Click:Connect(function()
+    if running then
+        stopAuto()
+        toggleButton.Text = "เริ่มทำงาน"
+        toggleButton.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+        statusLabel.Text = "สถานะ: หยุดอยู่"
+        statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    else
+        startAuto()
+        toggleButton.Text = "หยุดทำงาน"
+        toggleButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+        statusLabel.Text = "สถานะ: กำลังทำงาน"
+        statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    end
+end)

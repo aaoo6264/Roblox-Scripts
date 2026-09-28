@@ -1,0 +1,889 @@
+-- ============================
+-- CONFIG
+-- ============================
+local AUTO_DELAY = 1
+local TELEPORT_SETTLE_TIME = 0.3
+local RETURN_TO_START_AFTER_EGG = true
+local RETURN_TO_START_AFTER_FOSSIL = true
+local FOSSIL_COOLDOWN = 10       -- รอกี่วินาทีหลังวาปกลับ Start ก่อนไปเก็บฟอสซิลตัวถัดไป
+local GO_TO_START_ON_LAUNCH = true
+
+local GUARD_DANGER_RADIUS = 15
+
+-- วาปเข้ามุมปลอดภัยเลี่ยงสัตว์เฝ้า (เผื่อเป้าหมายที่เลือกดันมีสัตว์อยู่ใกล้)
+local SAFE_APPROACH_OFFSET = 6            -- ระยะที่ขยับจุดลงจอดออกจากสัตว์เฝ้า (studs)
+
+-- ระบบอีเว้น Fossil (ทำความสะอาดที่โต๊ะวิจัย)
+local RESEARCH_TABLE_STAND_DISTANCE = 4  -- ระยะห่างจากโต๊ะที่จะไปยืน (ถ้าไปผิดทิศ ลองใส่ค่าติดลบ)
+local RESEARCH_TABLE_STAND_Y_OFFSET = 3  -- ยกตัวขึ้นเล็กน้อยกันจมพื้น/โต๊ะ
+local FOSSIL_DIRT_WAIT_TIMEOUT = 10      -- เวลาสูงสุดที่รอ FossilDirt โผล่มาหลังกด PlacePrompt
+
+local GRAIN_SORT_BY_NEAREST = true -- เรียง Grain แบบใกล้สุดก่อน ลดระยะทางลากรวม
+local GRAIN_MAX_PASSES = 40        -- จำนวนรอบสูงสุดที่ยอมลาก ก่อนเลิกแล้วไปต่อ (กันค้าง)
+
+local ZONE_LIST = {
+    "Celestial Heights", "Coral Reef", "Crystal Mines", "Desert", "Jungle",
+    "Meadow", "Mystic Isles", "Prehistoric", "Savannah", "Winter"
+}
+
+-- Services
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+-- ============================
+-- STATE
+-- ============================
+local running = false
+local loopThread = nil
+
+local selectedZones = {}
+local collectEggs = true
+local collectFossils = true
+
+for _, zoneName in ipairs(ZONE_LIST) do
+    selectedZones[zoneName] = true
+end
+
+-- ============================
+-- UTILS
+-- ============================
+local function findChildIgnoreCase(parent, targetName)
+    for _, child in ipairs(parent:GetChildren()) do
+        if string.lower(child.Name) == string.lower(targetName) then
+            return child
+        end
+    end
+    return nil
+end
+
+local function getModelPosition(model)
+    if model:IsA("Model") then
+        if model.PrimaryPart then
+            return model.PrimaryPart.Position
+        end
+        local part = model:FindFirstChildWhichIsA("BasePart", true)
+        if part then return part.Position end
+    elseif model:IsA("BasePart") then
+        return model.Position
+    end
+    return nil
+end
+
+-- ============================
+-- GUARD (สัตว์เฝ้า) FUNCTIONS
+-- ============================
+local function getGuardPositions()
+    local guards = {}
+
+    local mapFolder = findChildIgnoreCase(workspace, "Map")
+    if not mapFolder then return guards end
+
+    local guardsFolder = findChildIgnoreCase(mapFolder, "ClientGuards")
+    if not guardsFolder then return guards end
+
+    for _, guard in ipairs(guardsFolder:GetChildren()) do
+        local pos = getModelPosition(guard)
+        if pos then
+            table.insert(guards, { name = guard.Name, position = pos })
+        end
+    end
+
+    return guards
+end
+
+local function isPositionDangerous(position, guards, radius)
+    for _, guard in ipairs(guards) do
+        local dist = (position - guard.position).Magnitude
+        if dist < radius then
+            return true, guard.name, dist
+        end
+    end
+    return false, nil, nil
+end
+
+-- คำนวณจุดลงจอดที่ปลอดภัยกว่า ถ้าเป้าหมายมีสัตว์เฝ้าอยู่ใกล้
+-- (ขยับจุดลงจอดออกจากสัตว์ตัวที่ใกล้ที่สุด แทนที่จะวาปตรงจุดเป้าหมายเป๊ะ)
+local function getSafeApproachPosition(targetPos, guards, prompt)
+    local nearestGuard = nil
+    local nearestDist = math.huge
+
+    for _, g in ipairs(guards) do
+        local d = (targetPos - g.position).Magnitude
+        if d < nearestDist then
+            nearestDist = d
+            nearestGuard = g
+        end
+    end
+
+    if not nearestGuard or nearestDist > GUARD_DANGER_RADIUS then
+        return targetPos -- ไม่มีสัตว์อยู่ใกล้ วาปตรงจุดเดิมได้เลย
+    end
+
+    local awayDir = Vector3.new(targetPos.X - nearestGuard.position.X, 0, targetPos.Z - nearestGuard.position.Z)
+    if awayDir.Magnitude < 0.1 then
+        awayDir = Vector3.new(1, 0, 0) -- กันกรณีตำแหน่งซ้อนกันพอดี
+    end
+    awayDir = awayDir.Unit
+
+    -- อย่าขยับไกลเกินระยะที่ prompt ยังกดได้ (MaxActivationDistance)
+    local maxDist = (prompt and prompt.MaxActivationDistance) or 10
+    local offsetDistance = math.min(SAFE_APPROACH_OFFSET, maxDist * 0.7)
+
+    local safePos = targetPos + awayDir * offsetDistance
+
+    warn(string.format(
+        "[DEBUG] มี %s อยู่ใกล้เป้าหมาย (ระยะ %.1f) วาปเข้ามุมปลอดภัยแทน ห่างออกไป %.1f studs",
+        nearestGuard.name, nearestDist, offsetDistance
+    ))
+
+    return safePos
+end
+
+-- ============================
+-- CORE FUNCTIONS: หาตำแหน่ง + prompt ของไข่ / ฟอสซิล
+-- ============================
+local function getEggTarget(eggModel)
+    local eggRoot = eggModel:FindFirstChild("EggRoot", true)
+    if not eggRoot then return nil, nil end
+
+    local attachment = eggRoot:FindFirstChild("EggPromptAttachment", true)
+    if not attachment then return nil, nil end
+
+    local prompt = attachment:FindFirstChildWhichIsA("ProximityPrompt")
+    if not prompt then return nil, nil end
+
+    return attachment.WorldPosition, prompt
+end
+
+local function getFossilTarget(fossilModel)
+    local stand = fossilModel:FindFirstChild("Stand", true)
+    if not stand then return nil, nil end
+
+    local attachment = stand:FindFirstChild("FossilPromptAttachment", true)
+    if not attachment then return nil, nil end
+
+    local prompt = attachment:FindFirstChildWhichIsA("ProximityPrompt")
+    if not prompt then return nil, nil end
+
+    return attachment.WorldPosition, prompt
+end
+
+local function collectAllTargets()
+    local targets = {}
+
+    local mapFolder = findChildIgnoreCase(workspace, "Map")
+    if not mapFolder then
+        warn("[DEBUG] ไม่พบ workspace.Map")
+        return targets
+    end
+
+    local stagesFolder = findChildIgnoreCase(mapFolder, "Stages")
+    if not stagesFolder then
+        warn("[DEBUG] ไม่พบ Map.Stages")
+        return targets
+    end
+
+    for zoneName, isSelected in pairs(selectedZones) do
+        if isSelected then
+            local stage = findChildIgnoreCase(stagesFolder, zoneName)
+            if stage then
+                if collectEggs then
+                    local eggsFolder = findChildIgnoreCase(stage, "SpawnedEggs")
+                    if eggsFolder then
+                        for _, egg in ipairs(eggsFolder:GetChildren()) do
+                            local pos, prompt = getEggTarget(egg)
+                            if pos and prompt then
+                                table.insert(targets, {
+                                    position = pos, prompt = prompt, model = egg,
+                                    name = egg.Name, zone = zoneName, kind = "ไข่"
+                                })
+                            end
+                        end
+                    end
+                end
+
+                if collectFossils then
+                    local fossilsFolder = findChildIgnoreCase(stage, "SpawnedFossils")
+                    if fossilsFolder then
+                        for _, fossil in ipairs(fossilsFolder:GetChildren()) do
+                            local pos, prompt = getFossilTarget(fossil)
+                            if pos and prompt then
+                                table.insert(targets, {
+                                    position = pos, prompt = prompt, model = fossil,
+                                    name = fossil.Name, zone = zoneName, kind = "ฟอสซิล"
+                                })
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return targets
+end
+
+local function getNearestTarget(rootPart)
+    local targets = collectAllTargets()
+    print("[DEBUG] รวมเป้าหมายที่ใช้งานได้จริงทั้งหมด:", #targets)
+
+    if #targets == 0 then return nil end
+
+    local guards = getGuardPositions()
+    print("[DEBUG] จำนวนสัตว์เฝ้าที่พบตอนนี้:", #guards)
+
+    local safeTargets = {}
+    local dangerousTargets = {}
+
+    for _, t in ipairs(targets) do
+        local isDanger, guardName, guardDist = isPositionDangerous(t.position, guards, GUARD_DANGER_RADIUS)
+        if isDanger then
+            t.dangerGuard = guardName
+            t.dangerDist = guardDist
+            table.insert(dangerousTargets, t)
+        else
+            table.insert(safeTargets, t)
+        end
+    end
+
+    print(string.format("[DEBUG] เป้าหมายปลอดภัย=%d | เสี่ยงมีสัตว์เฝ้า=%d", #safeTargets, #dangerousTargets))
+
+    local pool = #safeTargets > 0 and safeTargets or dangerousTargets
+    if #safeTargets == 0 then
+        warn("[DEBUG] ไม่มีเป้าหมายปลอดภัยเลย จำเป็นต้องเสี่ยงไปตัวใกล้สุดที่มีอยู่")
+    end
+
+    local nearest = nil
+    local nearestDist = math.huge
+
+    for _, t in ipairs(pool) do
+        local dist = (rootPart.Position - t.position).Magnitude
+        if dist < nearestDist then
+            nearestDist = dist
+            nearest = t
+        end
+    end
+
+    if nearest then
+        print(string.format(
+            "[DEBUG] เลือกเป้าหมาย: %s (%s) โซน %s %s",
+            nearest.name, nearest.kind, nearest.zone,
+            nearest.dangerGuard and ("(เสี่ยง! มี " .. nearest.dangerGuard .. " อยู่ใกล้)") or "(ปลอดภัย)"
+        ))
+    end
+
+    return nearest
+end
+
+local function getStartPosition()
+    local mapFolder = findChildIgnoreCase(workspace, "Map")
+    if not mapFolder then return nil end
+
+    local startObj = findChildIgnoreCase(mapFolder, "Start")
+    if not startObj then return nil end
+
+    return getModelPosition(startObj)
+end
+
+-- ============================
+-- TELEPORT (วาปตรงไปเลย)
+-- ============================
+local function teleportTo(rootPart, targetPosition)
+    rootPart.CFrame = CFrame.new(targetPosition)
+    task.wait(TELEPORT_SETTLE_TIME)
+end
+
+-- ============================
+-- FOSSIL EVENT (ทำความสะอาดฟอสซิลที่โต๊ะวิจัย)
+-- ============================
+
+-- หาตัวโต๊ะ: Map.FossilEvent.Station.ResearchTable.Table
+local function findFossilEventTable()
+    local mapFolder = findChildIgnoreCase(workspace, "Map")
+    if not mapFolder then
+        warn("[DEBUG] ไม่พบ workspace.Map")
+        return nil
+    end
+
+    local fossilEvent = findChildIgnoreCase(mapFolder, "FossilEvent")
+    if not fossilEvent then
+        warn("[DEBUG] ไม่พบ Map.FossilEvent")
+        return nil
+    end
+
+    local station = findChildIgnoreCase(fossilEvent, "Station")
+    if not station then
+        warn("[DEBUG] ไม่พบ FossilEvent.Station")
+        return nil
+    end
+
+    local researchTable = findChildIgnoreCase(station, "ResearchTable")
+    if not researchTable then
+        warn("[DEBUG] ไม่พบ Station.ResearchTable")
+        return nil
+    end
+
+    local tableObj = findChildIgnoreCase(researchTable, "Table")
+    if not tableObj then
+        warn("[DEBUG] ไม่พบ ResearchTable.Table")
+        return nil
+    end
+
+    return tableObj
+end
+
+local function getTablePosition(tableObj)
+    if tableObj:IsA("BasePart") then
+        return tableObj.Position
+    end
+    return getModelPosition(tableObj)
+end
+
+-- หา CFrame ของโต๊ะ (ไว้คำนวณทิศทางที่หันหน้าอยู่)
+local function getTableCFrame(tableObj)
+    if tableObj:IsA("BasePart") then
+        return tableObj.CFrame
+    end
+    if tableObj:IsA("Model") then
+        if tableObj.PrimaryPart then
+            return tableObj.PrimaryPart.CFrame
+        end
+        local part = tableObj:FindFirstChildWhichIsA("BasePart", true)
+        if part then return part.CFrame end
+    end
+    return nil
+end
+
+-- คำนวณจุดยืน "ข้างหน้าโต๊ะ" แทนที่จะยืนตรงกึ่งกลาง (กันทะลุ/จมโต๊ะ)
+local function getStandPositionInFrontOfTable(tableObj)
+    local tableCFrame = getTableCFrame(tableObj)
+    if not tableCFrame then
+        local pos = getTablePosition(tableObj)
+        if pos then
+            return pos + Vector3.new(0, RESEARCH_TABLE_STAND_Y_OFFSET, 0)
+        end
+        return nil
+    end
+
+    local standPos = tableCFrame.Position
+        + tableCFrame.LookVector * RESEARCH_TABLE_STAND_DISTANCE
+        + Vector3.new(0, RESEARCH_TABLE_STAND_Y_OFFSET, 0)
+
+    return standPos
+end
+
+local function getPlacePrompt(tableObj)
+    local prompt = tableObj:FindFirstChild("PlacePrompt", true)
+    if prompt and prompt:IsA("ProximityPrompt") then
+        return prompt
+    end
+    return tableObj:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+-- รอให้ Workspace.Ignore.FossilDirt โผล่ขึ้นมาหลังกด PlacePrompt
+local function waitForFossilDirt(timeout)
+    local ignoreFolder = workspace:FindFirstChild("Ignore")
+    if not ignoreFolder then
+        warn("[DEBUG] ไม่พบ workspace.Ignore")
+        return nil
+    end
+
+    local waitStart = tick()
+    local fossilDirt = findChildIgnoreCase(ignoreFolder, "FossilDirt")
+    while running and not fossilDirt and (tick() - waitStart) < timeout do
+        task.wait(0.2)
+        fossilDirt = findChildIgnoreCase(ignoreFolder, "FossilDirt")
+    end
+
+    return fossilDirt
+end
+
+-- เช็คความพร้อมของระบบเมาส์จำลอง
+local function checkMouseSimSupport()
+    return true
+end
+
+-- แปลงตำแหน่งโลก เป็นตำแหน่งบนจอ (พิกัดเมาส์)
+local function worldToScreen(worldPos)
+    local camera = workspace.CurrentCamera
+    if not camera then return nil, false end
+    local screenPos, onScreen = camera:WorldToViewportPoint(worldPos)
+    return Vector2.new(screenPos.X, screenPos.Y), onScreen
+end
+
+-- เรียงลำดับ Grain แบบใกล้สุดก่อน (greedy nearest-neighbor) ให้เส้นทางลากสั้นที่สุด
+local function sortGrainsNearestPath(grainList, startWorldPos)
+    local remaining = {}
+    for _, g in ipairs(grainList) do table.insert(remaining, g) end
+
+    local path = {}
+    local currentPos = startWorldPos
+
+    while #remaining > 0 do
+        local nearestIdx, nearestDist = 1, math.huge
+        for i, g in ipairs(remaining) do
+            local d = (g.Position - currentPos).Magnitude
+            if d < nearestDist then
+                nearestDist = d
+                nearestIdx = i
+            end
+        end
+        local chosen = table.remove(remaining, nearestIdx)
+        table.insert(path, chosen)
+        currentPos = chosen.Position
+    end
+
+    return path
+end
+
+-- ลากเมาส์ผ่านตำแหน่งจริงของ Grain ทุกเม็ดแบบความเร็วสูงสุด (Instant Sweep)
+local function dragThroughGrains(grainList)
+    if #grainList == 0 then return end
+
+    local orderedGrains = grainList
+    if GRAIN_SORT_BY_NEAREST then
+        orderedGrains = sortGrainsNearestPath(grainList, grainList[1].Position)
+    end
+
+    local screenPoints = {}
+    for _, g in ipairs(orderedGrains) do
+        local screenPos, onScreen = worldToScreen(g.Position)
+        if screenPos then
+            table.insert(screenPoints, screenPos)
+        end
+    end
+
+    if #screenPoints == 0 then
+        warn("[DEBUG] แปลงตำแหน่ง Grain เป็นพิกัดจอไม่ได้เลยสักจุด")
+        return
+    end
+
+    print(string.format("[DEBUG] เริ่มกวาด Grain %d จุดแบบความเร็วสูงสุด", #screenPoints))
+
+    local startPos = screenPoints[1]
+    
+    VirtualInputManager:SendMouseMoveEvent(startPos.X, startPos.Y, game)
+    VirtualInputManager:SendMouseButtonEvent(startPos.X, startPos.Y, 0, true, game, 1)
+
+    -- วนลูปย้ายเมาส์ผ่านทุกจุด
+    for i = 2, #screenPoints do
+        local point = screenPoints[i]
+        VirtualInputManager:SendMouseMoveEvent(point.X, point.Y, game)
+        
+        -- ต้องใส่บรรทัดนี้เพื่อให้เกมประมวลผลเมาส์ทันและไม่ค้าง (1 เฟรม)
+        task.wait() 
+    end
+
+    local lastPoint = screenPoints[#screenPoints]
+    VirtualInputManager:SendMouseButtonEvent(lastPoint.X, lastPoint.Y, 0, false, game, 1)
+end
+
+-- ทำอีเว้นทั้งหมด: วาปไปหน้าโต๊ะ → กด PlacePrompt → รอ FossilDirt → ถู Grain จนหมด
+local function doFossilEvent(rootPart)
+    if not checkMouseSimSupport() then
+        return
+    end
+
+    local tableObj = findFossilEventTable()
+    if not tableObj then
+        warn("[DEBUG] หาโต๊ะวิจัยไม่เจอ ข้ามการทำอีเว้นรอบนี้")
+        return
+    end
+
+    local standPos = getStandPositionInFrontOfTable(tableObj)
+    if not standPos then
+        warn("[DEBUG] หาตำแหน่งยืนหน้าโต๊ะไม่ได้ ข้ามการทำอีเว้นรอบนี้")
+        return
+    end
+
+    print("[DEBUG] วาปไปยืนหน้า ResearchTable เพื่อเริ่มอีเว้น")
+    teleportTo(rootPart, standPos)
+
+    local placePrompt = getPlacePrompt(tableObj)
+    if not placePrompt then
+        warn("[DEBUG] ไม่พบ PlacePrompt บนโต๊ะ ข้ามการทำอีเว้นรอบนี้")
+        return
+    end
+
+    print("[DEBUG] กด PlacePrompt เพื่อเปิดอีเว้น")
+    fireproximityprompt(placePrompt)
+
+    print("[DEBUG] กำลังรอ FossilDirt ปรากฏ...")
+    local fossilDirt = waitForFossilDirt(FOSSIL_DIRT_WAIT_TIMEOUT)
+
+    if not fossilDirt then
+        warn("[DEBUG] ไม่พบ FossilDirt เลยหลังกด PlacePrompt (timeout) ข้ามอีเว้นนี้ไป")
+        return
+    end
+
+    print("[DEBUG] เจอ FossilDirt แล้ว เริ่มถู Grain ทั้งหมด")
+
+    local passes = 0
+    while running and passes < GRAIN_MAX_PASSES do
+        local grainList = {}
+        for _, child in ipairs(fossilDirt:GetChildren()) do
+            if child:IsA("BasePart") and string.find(string.lower(child.Name), "grain") then
+                table.insert(grainList, child)
+            end
+        end
+
+        if #grainList == 0 then
+            print("[DEBUG] ไม่มี Grain เหลือแล้ว อีเว้นเสร็จสิ้น")
+            break
+        end
+
+        print(string.format("[DEBUG] เหลือ Grain %d เม็ด กำลังลาก (รอบที่ %d)...", #grainList, passes + 1))
+        dragThroughGrains(grainList)
+
+        passes = passes + 1
+        task.wait(0.1)
+    end
+
+    if passes >= GRAIN_MAX_PASSES then
+        warn("[DEBUG] ถูครบจำนวนรอบสูงสุดแล้วแต่ยังไม่หมด")
+    end
+
+    print("[DEBUG] จบการทำอีเว้น Fossil")
+end
+
+-- ============================
+-- MAIN LOOP
+-- ============================
+local function autoLoop()
+    local player = game.Players.LocalPlayer
+    print("[DEBUG] เริ่ม autoLoop")
+
+    local character = player.Character or player.CharacterAdded:Wait()
+    local humanoid = character:WaitForChild("Humanoid")
+    local rootPart = character:WaitForChild("HumanoidRootPart")
+
+    if GO_TO_START_ON_LAUNCH and running then
+        local startPos = getStartPosition()
+        if startPos then
+            print("[DEBUG] วาปไปที่ Start ก่อนเริ่มทำงาน")
+            teleportTo(rootPart, startPos)
+        else
+            warn("[DEBUG] ไม่พบตำแหน่ง Start เลยข้ามขั้นตอนนี้ไป")
+        end
+    end
+
+    while running do
+        local currentCharacter = player.Character
+        if not currentCharacter then
+            currentCharacter = player.CharacterAdded:Wait()
+        end
+        rootPart = currentCharacter:WaitForChild("HumanoidRootPart")
+
+        local target = getNearestTarget(rootPart)
+
+        if target then
+            local guards = getGuardPositions()
+            local warpPos = getSafeApproachPosition(target.position, guards, target.prompt)
+
+            print("[DEBUG] วาปไปที่:", warpPos, "| เป้าหมาย:", target.name)
+            teleportTo(rootPart, warpPos)
+
+            if running then
+                print(string.format("[DEBUG] กำลังเก็บ %s: %s", target.kind, target.name))
+                fireproximityprompt(target.prompt)
+
+                if target.kind == "ไข่" and RETURN_TO_START_AFTER_EGG and running then
+                    local startPos = getStartPosition()
+                    if startPos then
+                        print("[DEBUG] วาปกลับไปฝากไข่ที่ Start")
+                        teleportTo(rootPart, startPos)
+                    else
+                        warn("[DEBUG] ไม่พบตำแหน่ง Start เลยข้ามขั้นตอนฝากไข่ไป")
+                    end
+
+                elseif target.kind == "ฟอสซิล" and running then
+                    -- เก็บฟอสซิลแล้ว ไปทำอีเว้นที่โต๊ะวิจัยต่อทันที
+                    doFossilEvent(rootPart)
+
+                    if RETURN_TO_START_AFTER_FOSSIL and running then
+                        local startPos = getStartPosition()
+                        if startPos then
+                            print("[DEBUG] วาปกลับไปที่ Start (หลังทำอีเว้นฟอสซิล)")
+                            teleportTo(rootPart, startPos)
+                        else
+                            warn("[DEBUG] ไม่พบตำแหน่ง Start เลยข้ามขั้นตอนนี้ไป")
+                        end
+                    end
+
+                    if running then
+                        print(string.format("[DEBUG] รอ %d วินาทีก่อนไปเก็บฟอสซิลตัวถัดไป...", FOSSIL_COOLDOWN))
+                        task.wait(FOSSIL_COOLDOWN)
+                    end
+                end
+            end
+        else
+            print("[DEBUG] ไม่พบเป้าหมายในตอนนี้")
+        end
+
+        task.wait(AUTO_DELAY)
+    end
+
+    print("[DEBUG] ออกจาก autoLoop (running=false)")
+end
+
+local function startAuto()
+    if running then return end
+    running = true
+    loopThread = task.spawn(autoLoop)
+end
+
+local function stopAuto()
+    running = false
+end
+
+-- ============================
+-- GUI
+-- ============================
+local player = game.Players.LocalPlayer
+
+local function getGuiParent()
+    local ok, hiddenui = pcall(function() return gethui() end)
+    if ok and hiddenui then return hiddenui end
+
+    local ok2, coreGui = pcall(function() return game:GetService("CoreGui") end)
+    if ok2 and coreGui then return coreGui end
+
+    return player:WaitForChild("PlayerGui")
+end
+
+local guiParent = getGuiParent()
+
+local oldGui = guiParent:FindFirstChild("AutoEggFossilGui")
+if oldGui then oldGui:Destroy() end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AutoEggFossilGui"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 999
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = guiParent
+
+pcall(function()
+    if syn and syn.protect_gui then
+        syn.protect_gui(screenGui)
+    elseif protectgui then
+        protectgui(screenGui)
+    end
+end)
+
+print("[DEBUG] สร้าง GUI แล้ว, parent อยู่ที่:", screenGui.Parent:GetFullName())
+
+local floatButton = Instance.new("TextButton")
+floatButton.Size = UDim2.new(0, 40, 0, 40)
+floatButton.Position = UDim2.new(0, 20, 0.5, -20)
+floatButton.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+floatButton.Text = "🥚"
+floatButton.TextSize = 20
+floatButton.Visible = false
+floatButton.Parent = screenGui
+
+local floatCorner = Instance.new("UICorner")
+floatCorner.CornerRadius = UDim.new(1, 0)
+floatCorner.Parent = floatButton
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 240, 0, 430)
+frame.Position = UDim2.new(0, 20, 0.5, -215)
+frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = frame
+
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.new(0, 22, 0, 22)
+closeButton.Position = UDim2.new(1, -26, 0, 4)
+closeButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.Font = Enum.Font.GothamBold
+closeButton.TextSize = 14
+closeButton.Parent = frame
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 6)
+closeCorner.Parent = closeButton
+
+closeButton.MouseButton1Click:Connect(function()
+    frame.Visible = false
+    floatButton.Visible = true
+end)
+
+floatButton.MouseButton1Click:Connect(function()
+    frame.Visible = true
+    floatButton.Visible = false
+end)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -30, 0, 25)
+title.Position = UDim2.new(0, 8, 0, 4)
+title.BackgroundTransparency = 1
+title.Text = "Auto Collect Egg & Fossil"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = frame
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -16, 0, 20)
+statusLabel.Position = UDim2.new(0, 8, 0, 28)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "สถานะ: หยุดอยู่"
+statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 13
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = frame
+
+local typeRow = Instance.new("Frame")
+typeRow.Size = UDim2.new(1, -16, 0, 30)
+typeRow.Position = UDim2.new(0, 8, 0, 52)
+typeRow.BackgroundTransparency = 1
+typeRow.Parent = frame
+
+local eggToggle = Instance.new("TextButton")
+eggToggle.Size = UDim2.new(0.48, 0, 1, 0)
+eggToggle.Position = UDim2.new(0, 0, 0, 0)
+eggToggle.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+eggToggle.Text = "🥚 ไข่: เปิด"
+eggToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+eggToggle.Font = Enum.Font.GothamBold
+eggToggle.TextSize = 13
+eggToggle.Parent = typeRow
+
+local eggToggleCorner = Instance.new("UICorner")
+eggToggleCorner.CornerRadius = UDim.new(0, 6)
+eggToggleCorner.Parent = eggToggle
+
+local fossilToggle = Instance.new("TextButton")
+fossilToggle.Size = UDim2.new(0.48, 0, 1, 0)
+fossilToggle.Position = UDim2.new(0.52, 0, 0, 0)
+fossilToggle.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+fossilToggle.Text = "🦴 ฟอสซิล: เปิด"
+fossilToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+fossilToggle.Font = Enum.Font.GothamBold
+fossilToggle.TextSize = 13
+fossilToggle.Parent = typeRow
+
+local fossilToggleCorner = Instance.new("UICorner")
+fossilToggleCorner.CornerRadius = UDim.new(0, 6)
+fossilToggleCorner.Parent = fossilToggle
+
+eggToggle.MouseButton1Click:Connect(function()
+    collectEggs = not collectEggs
+    eggToggle.Text = collectEggs and "🥚 ไข่: เปิด" or "🥚 ไข่: ปิด"
+    eggToggle.BackgroundColor3 = collectEggs
+        and Color3.fromRGB(40, 160, 70) or Color3.fromRGB(90, 90, 90)
+end)
+
+fossilToggle.MouseButton1Click:Connect(function()
+    collectFossils = not collectFossils
+    fossilToggle.Text = collectFossils and "🦴 ฟอสซิล: เปิด" or "🦴 ฟอสซิล: ปิด"
+    fossilToggle.BackgroundColor3 = collectFossils
+        and Color3.fromRGB(40, 160, 70) or Color3.fromRGB(90, 90, 90)
+end)
+
+local zoneLabel = Instance.new("TextLabel")
+zoneLabel.Size = UDim2.new(1, -16, 0, 18)
+zoneLabel.Position = UDim2.new(0, 8, 0, 88)
+zoneLabel.BackgroundTransparency = 1
+zoneLabel.Text = "เลือกโซน (แตะเพื่อเปิด/ปิด):"
+zoneLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+zoneLabel.Font = Enum.Font.Gotham
+zoneLabel.TextSize = 12
+zoneLabel.TextXAlignment = Enum.TextXAlignment.Left
+zoneLabel.Parent = frame
+
+local zoneScroll = Instance.new("ScrollingFrame")
+zoneScroll.Size = UDim2.new(1, -16, 0, 220)
+zoneScroll.Position = UDim2.new(0, 8, 0, 108)
+zoneScroll.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+zoneScroll.BorderSizePixel = 0
+zoneScroll.ScrollBarThickness = 6
+zoneScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+zoneScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+zoneScroll.Parent = frame
+
+local zoneScrollCorner = Instance.new("UICorner")
+zoneScrollCorner.CornerRadius = UDim.new(0, 6)
+zoneScrollCorner.Parent = zoneScroll
+
+local zoneListLayout = Instance.new("UIListLayout")
+zoneListLayout.Padding = UDim.new(0, 4)
+zoneListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+zoneListLayout.Parent = zoneScroll
+
+local zonePadding = Instance.new("UIPadding")
+zonePadding.PaddingTop = UDim.new(0, 4)
+zonePadding.PaddingLeft = UDim.new(0, 4)
+zonePadding.PaddingRight = UDim.new(0, 4)
+zonePadding.Parent = zoneScroll
+
+local function makeZoneButton(zoneName, order)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -8, 0, 28)
+    btn.LayoutOrder = order
+    btn.BackgroundColor3 = selectedZones[zoneName]
+        and Color3.fromRGB(50, 110, 200) or Color3.fromRGB(55, 55, 55)
+    btn.Text = (selectedZones[zoneName] and "✅ " or "⬜ ") .. zoneName
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 13
+    btn.Parent = zoneScroll
+
+    local btnCorner2 = Instance.new("UICorner")
+    btnCorner2.CornerRadius = UDim.new(0, 5)
+    btnCorner2.Parent = btn
+
+    btn.MouseButton1Click:Connect(function()
+        selectedZones[zoneName] = not selectedZones[zoneName]
+        btn.BackgroundColor3 = selectedZones[zoneName]
+            and Color3.fromRGB(50, 110, 200) or Color3.fromRGB(55, 55, 55)
+        btn.Text = (selectedZones[zoneName] and "✅ " or "⬜ ") .. zoneName
+    end)
+
+    return btn
+end
+
+for i, zoneName in ipairs(ZONE_LIST) do
+    makeZoneButton(zoneName, i)
+end
+
+local toggleButton = Instance.new("TextButton")
+toggleButton.Size = UDim2.new(1, -16, 0, 34)
+toggleButton.Position = UDim2.new(0, 8, 1, -42)
+toggleButton.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+toggleButton.Text = "เริ่มทำงาน"
+toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleButton.Font = Enum.Font.GothamBold
+toggleButton.TextSize = 15
+toggleButton.Parent = frame
+
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(0, 6)
+btnCorner.Parent = toggleButton
+
+toggleButton.MouseButton1Click:Connect(function()
+    if running then
+        stopAuto()
+        toggleButton.Text = "เริ่มทำงาน"
+        toggleButton.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+        statusLabel.Text = "สถานะ: หยุดอยู่"
+        statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    else
+        startAuto()
+        toggleButton.Text = "หยุดทำงาน"
+        toggleButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+        statusLabel.Text = "สถานะ: กำลังทำงาน"
+        statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    end
+end)
